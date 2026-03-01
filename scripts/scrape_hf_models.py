@@ -454,6 +454,70 @@ def scrape_model(repo_id: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# GGUF source enrichment — find pre-quantized GGUF repos for known models
+# ---------------------------------------------------------------------------
+
+# Providers known to publish high-quality GGUF quantizations
+GGUF_PROVIDERS = ["unsloth", "bartowski"]
+
+
+def _model_gguf_repo_candidates(repo_id: str) -> list[tuple[str, str]]:
+    """Generate candidate GGUF repo names for a model.
+
+    Returns list of (provider, candidate_repo_id) tuples.
+    e.g. for "meta-llama/Llama-3.1-8B-Instruct" →
+         [("unsloth", "unsloth/Llama-3.1-8B-Instruct-GGUF"),
+          ("bartowski", "bartowski/Llama-3.1-8B-Instruct-GGUF")]
+    """
+    model_name = repo_id.split("/")[-1]
+    candidates = []
+    for provider in GGUF_PROVIDERS:
+        candidates.append((provider, f"{provider}/{model_name}-GGUF"))
+    return candidates
+
+
+def check_gguf_repo_exists(repo_id: str) -> bool:
+    """Check if a HuggingFace repo exists and has GGUF files."""
+    url = f"{HF_API}/{repo_id}"
+    req = urllib.request.Request(url, headers=_auth_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+            tags = info.get("tags", [])
+            return "gguf" in tags
+    except Exception:
+        return False
+
+
+def enrich_gguf_sources(models: list[dict]) -> int:
+    """Add gguf_sources to models by checking GGUF provider repos.
+
+    Returns the number of models enriched.
+    """
+    enriched = 0
+    total = len(models)
+    for i, model in enumerate(models, 1):
+        repo_id = model["name"]
+        candidates = _model_gguf_repo_candidates(repo_id)
+        sources = []
+
+        for provider, candidate_repo in candidates:
+            print(f"  [{i}/{total}] Checking {candidate_repo}...", end="")
+            if check_gguf_repo_exists(candidate_repo):
+                sources.append({"repo": candidate_repo, "provider": provider})
+                print(" ✓")
+            else:
+                print(" ✗")
+            time.sleep(0.15)  # Be polite to the API
+
+        if sources:
+            model["gguf_sources"] = sources
+            enriched += 1
+
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Auto-discovery from HuggingFace trending / most-downloaded
 # ---------------------------------------------------------------------------
 
@@ -561,6 +625,11 @@ def main():
     parser.add_argument(
         "--min-downloads", type=int, default=10000,
         help="Minimum download count for discovered models (default: 10000)."
+    )
+    parser.add_argument(
+        "--gguf-sources", action="store_true",
+        help="Enrich models with known GGUF download sources from "
+             "providers like unsloth and bartowski on HuggingFace."
     )
     parser.add_argument(
         "--token", type=str, default=None,
@@ -1068,6 +1137,13 @@ def main():
     # Sort by parameter count
     results.sort(key=lambda m: m["parameters_raw"])
 
+    # Enrich with GGUF download sources if requested
+    gguf_enriched = 0
+    if args.gguf_sources:
+        print(f"\nEnriching {len(results)} models with GGUF download sources...")
+        gguf_enriched = enrich_gguf_sources(results)
+        print(f"  Found GGUF sources for {gguf_enriched} models")
+
     # Write to both locations: repo root (for reference) and llmfit-core (compiled into binary)
     output_paths = ["data/hf_models.json", "llmfit-core/data/hf_models.json"]
     for output_path in output_paths:
@@ -1077,7 +1153,7 @@ def main():
 
     print(f"\n✅ Wrote {len(results)} models to {', '.join(output_paths)}")
     print(f"   Curated: {len(TARGET_MODELS)}, Fallbacks: {fallback_count}, "
-          f"Discovered: {discovered_count}")
+          f"Discovered: {discovered_count}, GGUF-sourced: {gguf_enriched}")
 
     # Print summary table
     print(f"\n{'Model':<50} {'Params':>8} {'Min RAM':>8} {'Rec RAM':>8} {'VRAM':>6}")
